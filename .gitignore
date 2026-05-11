@@ -1,0 +1,59 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.iml
+
+# Logs / runtime dumps
+*.log
+logs/
+**/logs/
+hs_err_pid*
+replay_pid*
+*.hprof
+*.jfr
+
+# Local environment / secrets
+.env
+.env.*
+!.env.example
+!**/.env.example
+*.pem
+*.key
+*.p12
+*.jks
+*.keystore
+server/src/main/resources/application.yml
+!server/src/main/resources/application.yml.example
+server/src/main/resources/application-local.yml
+server/src/main/resources/application-prod.yml
+server/src/main/resources/application-secret.yml
+
+# Java / Maven
+**/target/
+.m2/
+maven-repo/
+
+# Node / Electron
+**/node_modules/
+**/dist/
+**/dist-electron/
+**/release/
+**/.vite/
+**/.electron-cache/
+**/.electron-builder-cache/
+.npm-cache/
+npm-cache/
+*.tsbuildinfo
+
+# Packaged apps / archives
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.exe
+*.msi
+*.blockmap

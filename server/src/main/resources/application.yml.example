@@ -1,0 +1,14 @@
+server:
+  # 后端监听端口：前端 VITE_CIRCLE_SERVER_WS_URL 的端口要和这里一致。
+  port: 8080
+
+chat:
+  # 房间口令：客户端进入房间时输入的口令必须和这里一致。
+  access-key: "replace-with-your-access-key"
+  max-connections: 300
+  max-rooms: 50
+  max-users-per-room: 10
+  history-limit: 200
+  max-message-length: 500
+  # WebSocket 空闲超时：客户端每 20 秒发送 ping，断线后默认最多约 90 秒清理僵尸连接。
+  websocket-idle-timeout-ms: 90000

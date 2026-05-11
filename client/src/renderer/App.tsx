@@ -1,4 +1,6 @@
 import {
+  Camera,
+  Image as ImageIcon,
   Eye,
   MessageCircle,
   Minus,
@@ -11,7 +13,9 @@ import {
   X
 } from 'lucide-react';
 import {
+  ClipboardEvent,
   ChangeEvent,
+  DragEvent,
   FormEvent,
   KeyboardEvent,
   MouseEvent,
@@ -23,13 +27,18 @@ import {
   useState
 } from 'react';
 import { overlayApi } from './overlayApi';
-import type { ChatMessage, ConnectionConfig, Presence, ServerMessage } from './types';
+import type { ChatMessage, ConnectionConfig, ImagePayload, Presence, ServerMessage } from './types';
 
 const CONFIG_KEY = 'talk-overlay-config';
 const UI_KEY = 'talk-overlay-ui';
 const DEFAULT_ROOM_ID = 'CiRCLE';
 const MIN_PANEL_OPACITY = 8;
 const HEARTBEAT_INTERVAL_MS = 20_000;
+const IMAGE_MAX_LONG_EDGE = 1920;
+const IMAGE_TARGET_BYTES = 500 * 1024;
+const IMAGE_MAX_BYTES = 650 * 1024;
+const MAX_SOURCE_IMAGE_BYTES = 20 * 1024 * 1024;
+const ALLOWED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
 
 // 服务器 WebSocket 地址从 Vite 环境变量读取；未配置时默认连接本机 8080，方便开发调试。
 const DEFAULT_WS_URL = 'ws://127.0.0.1:8080/ws';
@@ -57,6 +66,24 @@ type SavedUi = {
   messageOpacity: number;
   alwaysOnTop: boolean;
 };
+type PendingImage = {
+  image: ImagePayload;
+  fileName: string;
+};
+type ComposerMenuPosition = {
+  x: number;
+  y: number;
+  selectionStart: number;
+  selectionEnd: number;
+  selectedText: string;
+};
+type MessageMenu = {
+  x: number;
+  y: number;
+  action: 'copy-text' | 'copy-image';
+  content?: string;
+  image?: ImagePayload;
+};
 
 const defaultConfig: ConnectionConfig = {
   nickname: '',
@@ -78,20 +105,27 @@ export function App() {
   const [error, setError] = useState('');
   const [showSettings, setShowSettings] = useState(false);
   const [showEmoji, setShowEmoji] = useState(false);
+  const [showScreenshotMenu, setShowScreenshotMenu] = useState(false);
   const [showMembers, setShowMembers] = useState(false);
   const [mentionIndex, setMentionIndex] = useState(0);
   const [caretPosition, setCaretPosition] = useState(0);
   const [dismissedMentionKey, setDismissedMentionKey] = useState('');
-  const [notice, setNotice] = useState('');
+  const [imageSending, setImageSending] = useState(false);
+  const [dragActive, setDragActive] = useState(false);
+  const [pendingImage, setPendingImage] = useState<PendingImage | null>(null);
+  const [previewImage, setPreviewImage] = useState<ImagePayload | null>(null);
+  const [composerMenu, setComposerMenu] = useState<ComposerMenuPosition | null>(null);
+  const [messageMenu, setMessageMenu] = useState<MessageMenu | null>(null);
   const [ui, setUi] = useState<SavedUi>(() => loadInitialUi());
   const wsRef = useRef<WebSocket | null>(null);
   const joinedRef = useRef(false);
   const heartbeatTimerRef = useRef<number | null>(null);
-  const copyNoticeTimerRef = useRef<number | null>(null);
   const longPressTimerRef = useRef<number | null>(null);
   const lastPongAtRef = useRef(0);
   const messageEndRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const composerRef = useRef<HTMLFormElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const canSend = status === 'joined' && input.trim().length > 0;
   const currentNickname = config.nickname.trim();
@@ -172,7 +206,6 @@ export function App() {
   useEffect(() => {
     return () => {
       stopHeartbeat();
-      stopCopyNoticeTimer();
       cancelMessageLongPress();
       wsRef.current?.close();
     };
@@ -195,6 +228,9 @@ export function App() {
     joinedRef.current = false;
     setMessages([]);
     setPresence(null);
+    setPendingImage(null);
+    setPreviewImage(null);
+    setMessageMenu(null);
     setMentionIndex(0);
     setDismissedMentionKey('');
     setStatus('connecting');
@@ -246,6 +282,9 @@ export function App() {
     joinedRef.current = false;
     setStatus('idle');
     setPresence(null);
+    setPendingImage(null);
+    setPreviewImage(null);
+    setMessageMenu(null);
   }
 
   function handleServerMessage(raw: string) {
@@ -316,13 +355,232 @@ export function App() {
   function handleInputChange(event: ChangeEvent<HTMLTextAreaElement>) {
     setInput(event.target.value);
     updateCaretPosition(event.target);
+    setComposerMenu(null);
+    setMessageMenu(null);
     setDismissedMentionKey('');
     setShowEmoji(false);
+    setShowScreenshotMenu(false);
   }
 
-  async function copyMessage(event: MouseEvent<HTMLElement>, content: string) {
+  function handleComposerContextMenu(event: MouseEvent<HTMLTextAreaElement>) {
     event.preventDefault();
-    await copyMessageContent(content);
+    setMessageMenu(null);
+    setShowScreenshotMenu(false);
+    const selectionStart = event.currentTarget.selectionStart ?? event.currentTarget.value.length;
+    const selectionEnd = event.currentTarget.selectionEnd ?? selectionStart;
+    const selectedText = selectionEnd > selectionStart
+      ? event.currentTarget.value.slice(selectionStart, selectionEnd)
+      : '';
+    setCaretPosition(selectionStart);
+    const bounds = composerRef.current?.getBoundingClientRect();
+    if (!bounds) {
+      setComposerMenu({ x: 48, y: 8, selectionStart, selectionEnd, selectedText });
+      return;
+    }
+    setComposerMenu({
+      x: clampNumber(event.clientX - bounds.left, 8, bounds.width - 78, 48),
+      y: clampNumber(event.clientY - bounds.top, 8, bounds.height - 36, 8),
+      selectionStart,
+      selectionEnd,
+      selectedText
+    });
+  }
+
+  function handleTextMessageContextMenu(event: MouseEvent<HTMLElement>, content: string) {
+    event.preventDefault();
+    setComposerMenu(null);
+    const selectedText = selectedTextInside(event.currentTarget);
+    setMessageMenu({
+      ...menuPosition(event.clientX, event.clientY, 78, 38),
+      action: 'copy-text',
+      content: selectedText || content
+    });
+  }
+
+  function handleImageMessageContextMenu(event: MouseEvent<HTMLElement>, image: ImagePayload) {
+    event.preventDefault();
+    setComposerMenu(null);
+    setMessageMenu({
+      ...menuPosition(event.clientX, event.clientY, 78, 38),
+      action: 'copy-image',
+      image
+    });
+  }
+
+  function handleImageFileChange(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.currentTarget.files?.[0];
+    event.currentTarget.value = '';
+    if (!file) {
+      return;
+    }
+    void prepareImageFile(file);
+  }
+
+  async function startScreenshot(hideWindow: boolean) {
+    if (imageSending) {
+      return;
+    }
+    setShowScreenshotMenu(false);
+    setShowEmoji(false);
+    setComposerMenu(null);
+    setMessageMenu(null);
+
+    try {
+      const result = await overlayApi.captureScreenshot({ hideWindow });
+      if (!result) {
+        return;
+      }
+      await prepareImageFile(dataUrlToFile(result.dataUrl, `screenshot-${Date.now()}.png`), { skipSourceLimit: true });
+    } catch {
+      setError('截图失败，请重试');
+    }
+  }
+
+  function handleComposerPaste(event: ClipboardEvent<HTMLTextAreaElement>) {
+    const file = firstImageFile(event.clipboardData.files);
+    if (!file) {
+      return;
+    }
+    event.preventDefault();
+    void prepareImageFile(file);
+  }
+
+  function handleChatDragEnter(event: DragEvent<HTMLElement>) {
+    if (!hasImageFile(event.dataTransfer)) {
+      return;
+    }
+    event.preventDefault();
+    setDragActive(true);
+  }
+
+  function handleChatDragOver(event: DragEvent<HTMLElement>) {
+    if (!hasImageFile(event.dataTransfer)) {
+      return;
+    }
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+    setDragActive(true);
+  }
+
+  function handleChatDragLeave(event: DragEvent<HTMLElement>) {
+    if (event.currentTarget.contains(event.relatedTarget as Node | null)) {
+      return;
+    }
+    setDragActive(false);
+  }
+
+  function handleChatDrop(event: DragEvent<HTMLElement>) {
+    if (!hasImageFile(event.dataTransfer)) {
+      return;
+    }
+    event.preventDefault();
+    setDragActive(false);
+    const file = firstImageFile(event.dataTransfer.files);
+    if (file) {
+      void prepareImageFile(file);
+    }
+  }
+
+  async function prepareImageFile(file: File, options: { skipSourceLimit?: boolean } = {}) {
+    if (status !== 'joined' || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      setError('连接后才能发送图片');
+      return;
+    }
+    if (imageSending) {
+      return;
+    }
+    if (!isAllowedImageFile(file)) {
+      setError('仅支持 JPG、PNG、WebP 图片');
+      return;
+    }
+    if (!options.skipSourceLimit && file.size > MAX_SOURCE_IMAGE_BYTES) {
+      setError('原图太大，请选择 20MB 以内的图片');
+      return;
+    }
+
+    setError('');
+    setShowEmoji(false);
+    setShowScreenshotMenu(false);
+    setImageSending(true);
+    try {
+      const image = await compressImageFile(file);
+      setPendingImage({
+        image,
+        fileName: file.name || '图片'
+      });
+    } catch (error) {
+      setError(error instanceof Error ? error.message : '图片处理失败，请换一张图片');
+    } finally {
+      setImageSending(false);
+    }
+  }
+
+  function confirmSendImage() {
+    if (!pendingImage) {
+      return;
+    }
+    const ws = wsRef.current;
+    if (status !== 'joined' || !ws || ws.readyState !== WebSocket.OPEN) {
+      setError('连接已断开，图片没有发送');
+      return;
+    }
+    ws.send(JSON.stringify({
+      type: 'chat',
+      messageType: 'image',
+      content: '',
+      image: pendingImage.image,
+      clientMsgId: randomId()
+    }));
+    setPendingImage(null);
+  }
+
+  async function pasteFromClipboardMenu() {
+    const menu = composerMenu;
+    setComposerMenu(null);
+    textareaRef.current?.focus();
+    try {
+      const imageFile = await readImageFileFromClipboard();
+      if (imageFile) {
+        await prepareImageFile(imageFile);
+        return;
+      }
+
+      const text = await navigator.clipboard.readText();
+      if (text) {
+        insertTextAtCaret(text, menu);
+      }
+    } catch {
+      setError('读取剪贴板失败，请使用 Ctrl + V');
+    }
+  }
+
+  async function copyFromComposerMenu() {
+    const selectedText = composerMenu?.selectedText ?? '';
+    setComposerMenu(null);
+    textareaRef.current?.focus();
+    if (!selectedText) {
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(selectedText);
+    } catch {
+      setError('复制失败，请手动选择文本复制');
+    }
+  }
+
+  async function copyFromMessageMenu() {
+    const menu = messageMenu;
+    setMessageMenu(null);
+    if (!menu) {
+      return;
+    }
+
+    if (menu.action === 'copy-image' && menu.image) {
+      await copyImageContent(menu.image);
+      return;
+    }
+
+    await copyMessageContent(menu.content ?? '');
   }
 
   function startMessageLongPress(event: PointerEvent<HTMLElement>, content: string) {
@@ -347,27 +605,28 @@ export function App() {
   async function copyMessageContent(content: string) {
     try {
       await navigator.clipboard.writeText(content);
-      setNotice('已复制');
-      stopCopyNoticeTimer();
-      copyNoticeTimerRef.current = window.setTimeout(() => {
-        setNotice('');
-        copyNoticeTimerRef.current = null;
-      }, 1200);
     } catch {
       setError('复制失败，请手动选择文本复制');
     }
   }
 
-  function stopCopyNoticeTimer() {
-    if (copyNoticeTimerRef.current === null) {
-      return;
+  async function copyImageContent(image: ImagePayload) {
+    try {
+      if (typeof ClipboardItem !== 'function' || typeof navigator.clipboard.write !== 'function') {
+        throw new Error('clipboard image write unsupported');
+      }
+      const blob = await imageToPngBlob(image.dataUrl);
+      await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
+    } catch {
+      setError('复制图片失败，请右键打开预览后手动截图');
     }
-    window.clearTimeout(copyNoticeTimerRef.current);
-    copyNoticeTimerRef.current = null;
   }
 
   function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
     event.stopPropagation();
+    setComposerMenu(null);
+    setMessageMenu(null);
+    setShowScreenshotMenu(false);
 
     if (showMentionPanel) {
       if (event.key === 'ArrowDown') {
@@ -401,6 +660,22 @@ export function App() {
 
   function updateCaretPosition(textarea: HTMLTextAreaElement) {
     setCaretPosition(textarea.selectionStart ?? textarea.value.length);
+  }
+
+  function insertTextAtCaret(text: string, range?: Pick<ComposerMenuPosition, 'selectionStart' | 'selectionEnd'> | null) {
+    const textarea = textareaRef.current;
+    const start = range?.selectionStart ?? textarea?.selectionStart ?? caretPosition;
+    const end = range?.selectionEnd ?? textarea?.selectionEnd ?? caretPosition;
+    const nextInput = `${input.slice(0, start)}${text}${input.slice(end)}`;
+    const nextCaretPosition = start + text.length;
+
+    setInput(nextInput);
+    setCaretPosition(nextCaretPosition);
+    setDismissedMentionKey('');
+    window.requestAnimationFrame(() => {
+      textareaRef.current?.focus();
+      textareaRef.current?.setSelectionRange(nextCaretPosition, nextCaretPosition);
+    });
   }
 
   function insertMention(nickname: string) {
@@ -547,7 +822,14 @@ export function App() {
             </form>
           </div>
         ) : (
-          <main className="chat-view">
+          <main
+            className={`chat-view ${dragActive ? 'dragging' : ''}`}
+            onDragEnter={handleChatDragEnter}
+            onDragOver={handleChatDragOver}
+            onDragLeave={handleChatDragLeave}
+            onDrop={handleChatDrop}
+          >
+            {dragActive && <div className="drop-overlay">松开发送图片</div>}
             {showMembers && (
               <div className="members-panel">
                 {(presence?.members ?? []).map((member) => (
@@ -556,7 +838,7 @@ export function App() {
               </div>
             )}
 
-            <div className="messages" role="log">
+            <div className="messages" role="log" onClick={() => setMessageMenu(null)}>
               {messages.length === 0 ? (
                 <div className="empty-state">
                   <Eye size={18} />
@@ -566,16 +848,19 @@ export function App() {
                 messages.map((message) => {
                   const isSystemMessage = message.sender === '';
                   const isMine = message.sender === currentNickname;
+                  const isImage = isImageMessage(message);
                   return (
                     <article
                       key={message.messageId}
-                      className={`message ${isSystemMessage ? 'system' : isMine ? 'mine' : ''}`}
-                      title="右键复制"
-                      onContextMenu={(event) => copyMessage(event, message.content)}
-                      onPointerDown={(event) => startMessageLongPress(event, message.content)}
-                      onPointerUp={cancelMessageLongPress}
-                      onPointerCancel={cancelMessageLongPress}
-                      onPointerLeave={cancelMessageLongPress}
+                      className={`message ${isSystemMessage ? 'system' : isMine ? 'mine' : ''} ${isImage ? 'image' : ''}`}
+                      title={isImage ? '点击查看图片，右键复制' : '右键复制'}
+                      onContextMenu={isImage && message.image
+                        ? (event) => handleImageMessageContextMenu(event, message.image as ImagePayload)
+                        : (event) => handleTextMessageContextMenu(event, message.content)}
+                      onPointerDown={isImage ? undefined : (event) => startMessageLongPress(event, message.content)}
+                      onPointerUp={isImage ? undefined : cancelMessageLongPress}
+                      onPointerCancel={isImage ? undefined : cancelMessageLongPress}
+                      onPointerLeave={isImage ? undefined : cancelMessageLongPress}
                     >
                       {isSystemMessage ? (
                         <p>{message.content}</p>
@@ -585,7 +870,13 @@ export function App() {
                             <span>{message.sender}</span>
                             <time>{formatTime(message.serverTime)}</time>
                           </div>
-                          <p>{renderMessageContent(message.content, currentNickname)}</p>
+                          {isImage && message.image ? (
+                            <button className="image-message" type="button" onClick={() => setPreviewImage(message.image ?? null)}>
+                              <img src={message.image.dataUrl} alt="聊天图片" />
+                            </button>
+                          ) : (
+                            <p>{renderMessageContent(message.content, currentNickname)}</p>
+                          )}
                         </>
                       )}
                     </article>
@@ -595,7 +886,7 @@ export function App() {
               <div ref={messageEndRef} />
             </div>
 
-            <form className="composer" onSubmit={sendMessage}>
+            <form ref={composerRef} className="composer" onSubmit={sendMessage}>
               {showEmoji && (
                 <div className="emoji-panel">
                   {EMOJIS.map((emoji) => (
@@ -605,18 +896,67 @@ export function App() {
                   ))}
                 </div>
               )}
-              <button type="button" className="icon-button" title="emoji" onClick={() => setShowEmoji((current) => !current)}>
+              <button
+                type="button"
+                className={`icon-button ${showEmoji ? 'active' : ''}`}
+                title="表情"
+                onClick={() => {
+                  setShowEmoji((current) => !current);
+                  setShowScreenshotMenu(false);
+                  setComposerMenu(null);
+                }}
+              >
                 <Smile size={18} />
               </button>
+              <button
+                type="button"
+                className={`icon-button ${showScreenshotMenu ? 'active' : ''}`}
+                title="截图"
+                disabled={imageSending}
+                onClick={() => {
+                  setShowScreenshotMenu((current) => !current);
+                  setShowEmoji(false);
+                  setComposerMenu(null);
+                  setMessageMenu(null);
+                }}
+              >
+                <Camera size={18} />
+              </button>
+              <button
+                type="button"
+                className="icon-button"
+                title="发送图片"
+                disabled={imageSending}
+                onClick={() => {
+                  setShowScreenshotMenu(false);
+                  setShowEmoji(false);
+                  fileInputRef.current?.click();
+                }}
+              >
+                <ImageIcon size={18} />
+              </button>
+              <input
+                ref={fileInputRef}
+                className="file-input"
+                type="file"
+                accept="image/jpeg,image/png,image/webp"
+                onChange={handleImageFileChange}
+              />
               <textarea
                 ref={textareaRef}
                 value={input}
                 onChange={handleInputChange}
+                onContextMenu={handleComposerContextMenu}
+                onPaste={handleComposerPaste}
                 onKeyDown={handleComposerKeyDown}
                 onKeyUp={(event) => updateCaretPosition(event.currentTarget)}
-                onClick={(event) => updateCaretPosition(event.currentTarget)}
+                onClick={(event) => {
+                  updateCaretPosition(event.currentTarget);
+                  setComposerMenu(null);
+                  setShowScreenshotMenu(false);
+                }}
                 onSelect={(event) => updateCaretPosition(event.currentTarget)}
-                placeholder="输入消息"
+                placeholder={imageSending ? '图片压缩中...' : '输入消息'}
                 maxLength={500}
               />
               <button className="send-button" type="submit" title="发送" disabled={!canSend}>
@@ -637,6 +977,44 @@ export function App() {
                   ))}
                 </div>
               )}
+              {showScreenshotMenu && (
+                <div className="screenshot-menu">
+                  <button
+                    type="button"
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={() => void startScreenshot(true)}
+                  >
+                    隐藏窗口截图
+                  </button>
+                  <button
+                    type="button"
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={() => void startScreenshot(false)}
+                  >
+                    保留窗口截图
+                  </button>
+                </div>
+              )}
+              {composerMenu && (
+                <div className="composer-menu" style={{ left: composerMenu.x, top: composerMenu.y }}>
+                  {composerMenu.selectedText && (
+                    <button
+                      type="button"
+                      onMouseDown={(event) => event.preventDefault()}
+                      onClick={() => void copyFromComposerMenu()}
+                    >
+                      复制
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={() => void pasteFromClipboardMenu()}
+                  >
+                    粘贴
+                  </button>
+                </div>
+              )}
             </form>
           </main>
         )}
@@ -649,8 +1027,64 @@ export function App() {
           {status === 'joined' && <button onClick={disconnect}>断开</button>}
         </footer>
 
-        {notice && <div className="notice-toast">{notice}</div>}
-        {error && <div className={`error-toast ${notice ? 'stacked' : ''}`}>{error}</div>}
+        {error && <div className="error-toast">{error}</div>}
+        {messageMenu && (
+          <div className="message-menu" style={{ left: messageMenu.x, top: messageMenu.y }}>
+            <button
+              type="button"
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={() => void copyFromMessageMenu()}
+            >
+              复制
+            </button>
+          </div>
+        )}
+        {pendingImage && (
+          <div className="image-confirm-backdrop" onClick={() => setPendingImage(null)}>
+            <div className="image-confirm-dialog" onClick={(event) => event.stopPropagation()}>
+              <div className="image-confirm-header">
+                <strong>发送图片</strong>
+                <button type="button" title="取消发送" onClick={() => setPendingImage(null)}>
+                  <X size={16} />
+                </button>
+              </div>
+              <img src={pendingImage.image.dataUrl} alt="待发送图片" />
+              <div className="image-confirm-meta">
+                <span>{pendingImage.fileName}</span>
+                <strong>
+                  {pendingImage.image.width}×{pendingImage.image.height} · {formatBytes(pendingImage.image.size)}
+                </strong>
+              </div>
+              <div className="image-confirm-actions">
+                <button type="button" className="secondary-button" onClick={() => setPendingImage(null)}>
+                  取消
+                </button>
+                <button type="button" className="primary-action-button" onClick={confirmSendImage}>
+                  发送
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+        {previewImage && (
+          <div
+            className="image-preview-backdrop"
+            onClick={() => {
+              setPreviewImage(null);
+              setMessageMenu(null);
+            }}
+          >
+            <button className="image-preview-close" type="button" title="关闭预览" onClick={() => setPreviewImage(null)}>
+              <X size={18} />
+            </button>
+            <img
+              src={previewImage.dataUrl}
+              alt="图片预览"
+              onClick={(event) => event.stopPropagation()}
+              onContextMenu={(event) => handleImageMessageContextMenu(event, previewImage)}
+            />
+          </div>
+        )}
       </section>
     </div>
   );
@@ -688,6 +1122,278 @@ function clampNumber(value: unknown, min: number, max: number, fallback: number)
 
 function saveJson(key: string, value: unknown) {
   localStorage.setItem(key, JSON.stringify(value));
+}
+
+function isImageMessage(message: ChatMessage) {
+  return message.messageType === 'image' && Boolean(message.image?.dataUrl);
+}
+
+function menuPosition(clientX: number, clientY: number, width: number, height: number) {
+  return {
+    x: clampNumber(clientX, 8, window.innerWidth - width - 8, 8),
+    y: clampNumber(clientY, 8, window.innerHeight - height - 8, 8)
+  };
+}
+
+function selectedTextInside(element: HTMLElement) {
+  const selection = window.getSelection();
+  if (!selection || selection.rangeCount === 0 || selection.isCollapsed) {
+    return '';
+  }
+
+  const selectedText = selection.toString();
+  if (!selectedText) {
+    return '';
+  }
+
+  for (let index = 0; index < selection.rangeCount; index += 1) {
+    const range = selection.getRangeAt(index);
+    try {
+      if (range.intersectsNode(element)) {
+        return selectedText;
+      }
+    } catch {
+      return '';
+    }
+  }
+  return '';
+}
+
+function isAllowedImageFile(file: File) {
+  const lowerName = file.name.toLocaleLowerCase();
+  return ALLOWED_IMAGE_TYPES.has(file.type) || /\.(jpe?g|png|webp)$/u.test(lowerName);
+}
+
+function firstImageFile(files: FileList) {
+  return Array.from(files).find(isAllowedImageFile) ?? null;
+}
+
+async function readImageFileFromClipboard() {
+  if (!navigator.clipboard || typeof navigator.clipboard.read !== 'function') {
+    return null;
+  }
+
+  const items = await navigator.clipboard.read();
+  for (const item of items) {
+    const imageType = item.types.find((type) => ALLOWED_IMAGE_TYPES.has(type));
+    if (!imageType) {
+      continue;
+    }
+    const blob = await item.getType(imageType);
+    return new File([blob], `clipboard-image.${imageExtension(imageType)}`, { type: imageType });
+  }
+  return null;
+}
+
+function dataUrlToFile(dataUrl: string, fileName: string) {
+  const [header, body] = dataUrl.split(',');
+  if (!header || !body) {
+    throw new Error('截图数据无效');
+  }
+  const mimeType = header.match(/^data:(.*?);base64$/u)?.[1] || 'image/png';
+  const binary = window.atob(body);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return new File([bytes], fileName, { type: mimeType });
+}
+
+function imageExtension(mimeType: string) {
+  if (mimeType === 'image/jpeg') {
+    return 'jpg';
+  }
+  if (mimeType === 'image/webp') {
+    return 'webp';
+  }
+  return 'png';
+}
+
+function hasImageFile(dataTransfer: DataTransfer) {
+  if (!Array.from(dataTransfer.types).includes('Files')) {
+    return false;
+  }
+  const items = Array.from(dataTransfer.items ?? []);
+  if (items.length === 0) {
+    return true;
+  }
+  return items.some((item) => item.kind === 'file' && (item.type === '' || item.type.startsWith('image/')));
+}
+
+async function compressImageFile(file: File): Promise<ImagePayload> {
+  let decoded: DecodedImage | null = null;
+  try {
+    decoded = await decodeImage(file);
+    if (decoded.width <= 0 || decoded.height <= 0) {
+      throw new Error('图片尺寸无效，请换一张图片');
+    }
+
+    const { width, height } = fitImageSize(decoded.width, decoded.height, IMAGE_MAX_LONG_EDGE);
+    const webpCanvas = drawImageToCanvas(decoded, width, height);
+    let blob = await encodeCanvasWithinLimit(webpCanvas, 'image/webp');
+
+    if (!blob) {
+      const jpegCanvas = drawImageToCanvas(decoded, width, height, '#ffffff');
+      blob = await encodeCanvasWithinLimit(jpegCanvas, 'image/jpeg');
+    }
+
+    if (!blob) {
+      throw new Error('图片压缩后仍超过 650KB，请换一张更小的图片');
+    }
+
+    return {
+      mimeType: blob.type,
+      dataUrl: await blobToDataUrl(blob),
+      width,
+      height,
+      size: blob.size
+    };
+  } catch (error) {
+    if (error instanceof Error) {
+      throw error;
+    }
+    throw new Error('图片读取失败，请换一张图片');
+  } finally {
+    decoded?.close();
+  }
+}
+
+type DecodedImage = {
+  source: CanvasImageSource;
+  width: number;
+  height: number;
+  close: () => void;
+};
+
+async function decodeImage(file: File): Promise<DecodedImage> {
+  if (typeof createImageBitmap === 'function') {
+    try {
+      const bitmap = await createImageBitmap(file);
+      return {
+        source: bitmap,
+        width: bitmap.width,
+        height: bitmap.height,
+        close: () => bitmap.close()
+      };
+    } catch {
+      // 某些图片编码浏览器无法直接 createImageBitmap，继续走 Image 兜底解码。
+    }
+  }
+
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const image = new Image();
+    image.onload = () => {
+      resolve({
+        source: image,
+        width: image.naturalWidth,
+        height: image.naturalHeight,
+        close: () => URL.revokeObjectURL(url)
+      });
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error('图片读取失败，请换一张图片'));
+    };
+    image.src = url;
+  });
+}
+
+function fitImageSize(width: number, height: number, maxLongEdge: number) {
+  const scale = Math.min(1, maxLongEdge / Math.max(width, height));
+  return {
+    width: Math.max(1, Math.round(width * scale)),
+    height: Math.max(1, Math.round(height * scale))
+  };
+}
+
+function drawImageToCanvas(decoded: DecodedImage, width: number, height: number, background?: string) {
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext('2d');
+  if (!context) {
+    throw new Error('当前环境不支持图片压缩');
+  }
+  if (background) {
+    context.fillStyle = background;
+    context.fillRect(0, 0, width, height);
+  }
+  context.imageSmoothingEnabled = true;
+  context.imageSmoothingQuality = 'high';
+  context.drawImage(decoded.source, 0, 0, width, height);
+  return canvas;
+}
+
+async function encodeCanvasWithinLimit(canvas: HTMLCanvasElement, mimeType: 'image/webp' | 'image/jpeg') {
+  const qualities = [0.92, 0.88, 0.84, 0.8, 0.76, 0.72, 0.68, 0.64, 0.6, 0.56, 0.52, 0.48];
+  let firstUnderLimit: Blob | null = null;
+
+  for (const quality of qualities) {
+    const blob = await canvasToBlob(canvas, mimeType, quality);
+    if (!blob || blob.type !== mimeType) {
+      continue;
+    }
+    if (blob.size <= IMAGE_TARGET_BYTES) {
+      return blob;
+    }
+    if (blob.size <= IMAGE_MAX_BYTES && !firstUnderLimit) {
+      firstUnderLimit = blob;
+    }
+  }
+
+  return firstUnderLimit;
+}
+
+function canvasToBlob(canvas: HTMLCanvasElement, mimeType: string, quality: number) {
+  return new Promise<Blob | null>((resolve) => {
+    canvas.toBlob(resolve, mimeType, quality);
+  });
+}
+
+function blobToDataUrl(blob: Blob) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === 'string') {
+        resolve(reader.result);
+        return;
+      }
+      reject(new Error('图片转换失败，请换一张图片'));
+    };
+    reader.onerror = () => reject(new Error('图片转换失败，请换一张图片'));
+    reader.readAsDataURL(blob);
+  });
+}
+
+function imageToPngBlob(dataUrl: string) {
+  return new Promise<Blob>((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = image.naturalWidth;
+      canvas.height = image.naturalHeight;
+      const context = canvas.getContext('2d');
+      if (!context) {
+        reject(new Error('当前环境不支持复制图片'));
+        return;
+      }
+      context.drawImage(image, 0, 0);
+      canvas.toBlob((blob) => {
+        if (!blob) {
+          reject(new Error('图片转换失败'));
+          return;
+        }
+        resolve(blob);
+      }, 'image/png');
+    };
+    image.onerror = () => reject(new Error('图片读取失败'));
+    image.src = dataUrl;
+  });
+}
+
+function formatBytes(value: number) {
+  return `${Math.max(1, Math.round(value / 1024))}KB`;
 }
 
 function randomId() {

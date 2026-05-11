@@ -1,8 +1,20 @@
+export type MessageType = 'text' | 'image';
+
+export type ImagePayload = {
+  mimeType: string;
+  dataUrl: string;
+  width: number;
+  height: number;
+  size: number;
+};
+
 export type ChatMessage = {
   messageId: string;
   sender: string;
   content: string;
   serverTime: number;
+  messageType?: MessageType;
+  image?: ImagePayload | null;
 };
 
 export type Presence = {

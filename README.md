@@ -18,7 +18,9 @@ CiRCLE/
 - 固定单房间：客户端默认进入 `CiRCLE` 房间，不需要输入房间号
 - 进入房间需要昵称和口令，同一房间昵称不能重复
 - 在线人数和在线成员列表
-- 文字消息和 Unicode emoji
+- 文字消息、Unicode emoji 和图片消息
+- 图片可从文件夹选择、截图粘贴、拖拽或客户端框选截图发送，发送前会先显示确认预览
+- 图片发送前会在客户端压缩，默认最长边 `1920px`、目标约 `500KB`、最大约 `650KB`
 - 输入 `@` 时弹出在线成员列表，选中后插入 `@昵称`
 - 消息中 `@我的昵称` 会高亮显示
 - 成员加入或离开时显示居中的系统提示
@@ -26,7 +28,7 @@ CiRCLE/
 - 收到他人消息时，如果窗口最小化或不可见，会触发任务栏提醒
 - 服务端保留内存短历史，默认每个房间最近 `200` 条消息
 - 不保存永久聊天记录
-- 暂不支持图片、文件、GIF、自定义表情包
+- 暂不支持 GIF 动图、文件、自定义表情包
 
 ## 环境要求
 
@@ -94,6 +96,8 @@ chat:
   max-users-per-room: 10
   history-limit: 200
   max-message-length: 500
+  max-image-bytes: 665600
+  websocket-message-buffer-bytes: 950000
   websocket-idle-timeout-ms: 90000
 ```
 
@@ -106,9 +110,13 @@ chat:
 - `chat.max-users-per-room`：单个房间最多在线人数
 - `chat.history-limit`：每个房间保留的最近消息条数，只保存在内存中
 - `chat.max-message-length`：单条消息最大字符数
+- `chat.max-image-bytes`：单张图片压缩后允许发送的最大字节数
+- `chat.websocket-message-buffer-bytes`：WebSocket 单条消息缓冲区大小，图片会以 dataUrl 放在 JSON 中，需要大于图片 base64 体积
 - `chat.websocket-idle-timeout-ms`：WebSocket 空闲超时时间，用于清理异常断开的连接
 
 客户端每 `20` 秒发送一次 `ping` 心跳。连接异常断开后，如果服务端在空闲超时时间内收不到任何消息，会自动关闭并清理该连接。
+
+图片只做临时聊天传递：压缩发生在客户端，服务端只校验和转发，不保存到磁盘。图片和文字消息共用内存历史，服务端重启后都会丢失。
 
 ## 本地运行
 

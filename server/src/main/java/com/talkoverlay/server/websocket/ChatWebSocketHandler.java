@@ -4,12 +4,15 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.talkoverlay.server.config.ChatProperties;
 import com.talkoverlay.server.model.ChatMessage;
+import com.talkoverlay.server.model.ChatMessage.ImagePayload;
 import com.talkoverlay.server.room.ConnectionLimiter;
 import com.talkoverlay.server.room.MessageHistoryStore;
 import com.talkoverlay.server.room.RoomRegistry;
 import com.talkoverlay.server.room.RoomRegistry.JoinStatus;
 import com.talkoverlay.server.room.RoomRegistry.RoomSnapshot;
 import java.io.IOException;
+import java.util.Base64;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -32,7 +35,14 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
 
     private static final int MAX_ROOM_ID_LENGTH = 40;
     private static final int MAX_NICKNAME_LENGTH = 20;
+    private static final String MESSAGE_TYPE_TEXT = "text";
+    private static final String MESSAGE_TYPE_IMAGE = "image";
     private static final String SYSTEM_SENDER = "";
+    private static final Set<String> ALLOWED_IMAGE_MIME_TYPES = Set.of(
+        "image/webp",
+        "image/jpeg",
+        "image/png"
+    );
 
     private final ObjectMapper objectMapper;
     private final ChatProperties properties;
@@ -197,6 +207,26 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
             return;
         }
 
+        String messageType = text(body, "messageType");
+        if (messageType.isBlank()) {
+            messageType = MESSAGE_TYPE_TEXT;
+        }
+
+        try {
+            switch (messageType) {
+                case MESSAGE_TYPE_TEXT -> handleTextChat(session, participant, body);
+                case MESSAGE_TYPE_IMAGE -> handleImageChat(participant, body);
+                default -> sendError(session, "unsupported messageType");
+            }
+        } catch (InvalidClientMessageException ex) {
+            sendError(session, ex.getMessage());
+        }
+    }
+
+    /**
+     * 处理普通文本消息。
+     */
+    private void handleTextChat(WebSocketSession session, RoomRegistry.ParticipantInfo participant, JsonNode body) throws IOException {
         String content = text(body, "content");
         if (content.isBlank()) {
             sendError(session, "empty message");
@@ -211,16 +241,67 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
             UUID.randomUUID().toString(),
             participant.nickname(),
             content,
-            System.currentTimeMillis()
+            System.currentTimeMillis(),
+            MESSAGE_TYPE_TEXT,
+            null
         );
-        historyStore.add(participant.roomId(), chatMessage);
-        broadcast(roomRegistry.roomSessions(participant.roomId()), Map.of(
-            "type", "chat",
-            "messageId", chatMessage.messageId(),
-            "sender", chatMessage.sender(),
-            "content", chatMessage.content(),
-            "serverTime", chatMessage.serverTime()
-        ));
+        broadcastChatMessage(participant.roomId(), chatMessage);
+    }
+
+    /**
+     * 处理图片消息。
+     *
+     * <p>客户端已经完成压缩；服务端仍会校验 MIME、dataUrl 和实际字节数，
+     * 防止超大图片或伪造字段占用过多内存与带宽。</p>
+     */
+    private void handleImageChat(RoomRegistry.ParticipantInfo participant, JsonNode body) throws IOException {
+        JsonNode imageNode = body.get("image");
+        if (imageNode == null || !imageNode.isObject()) {
+            throw new InvalidClientMessageException("invalid image");
+        }
+
+        String mimeType = text(imageNode, "mimeType");
+        String dataUrl = text(imageNode, "dataUrl");
+        int width = intValue(imageNode, "width");
+        int height = intValue(imageNode, "height");
+
+        if (!ALLOWED_IMAGE_MIME_TYPES.contains(mimeType)) {
+            throw new InvalidClientMessageException("unsupported image type");
+        }
+        if (width <= 0 || height <= 0) {
+            throw new InvalidClientMessageException("invalid image dimensions");
+        }
+
+        String prefix = "data:" + mimeType + ";base64,";
+        if (!dataUrl.startsWith(prefix)) {
+            throw new InvalidClientMessageException("invalid image data");
+        }
+
+        long actualSize = decodedImageSize(dataUrl.substring(prefix.length()));
+        if (actualSize <= 0) {
+            throw new InvalidClientMessageException("invalid image data");
+        }
+        if (actualSize > properties.getMaxImageBytes()) {
+            throw new InvalidClientMessageException("image is too large");
+        }
+
+        ChatMessage chatMessage = new ChatMessage(
+            UUID.randomUUID().toString(),
+            participant.nickname(),
+            "",
+            System.currentTimeMillis(),
+            MESSAGE_TYPE_IMAGE,
+            new ImagePayload(mimeType, dataUrl, width, height, actualSize)
+        );
+        broadcastChatMessage(participant.roomId(), chatMessage);
+    }
+
+    /**
+     * 写入历史并广播聊天消息。
+     */
+    private void broadcastChatMessage(String roomId, ChatMessage chatMessage) {
+        historyStore.add(roomId, chatMessage);
+        broadcast(roomRegistry.roomSessions(roomId), chatPayload(chatMessage));
     }
 
     /**
@@ -264,13 +345,31 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
      * 这类消息只实时广播，不写入历史，避免新用户进入时看到大量旧的加入/离开提示。</p>
      */
     private void broadcastSystemMessage(RoomSnapshot snapshot, String content) {
-        broadcast(snapshot.sessions(), Map.of(
-            "type", "chat",
-            "messageId", UUID.randomUUID().toString(),
-            "sender", SYSTEM_SENDER,
-            "content", content,
-            "serverTime", System.currentTimeMillis()
-        ));
+        broadcast(snapshot.sessions(), chatPayload(new ChatMessage(
+            UUID.randomUUID().toString(),
+            SYSTEM_SENDER,
+            content,
+            System.currentTimeMillis(),
+            MESSAGE_TYPE_TEXT,
+            null
+        )));
+    }
+
+    /**
+     * 生成发给客户端的聊天消息负载。
+     */
+    private Map<String, Object> chatPayload(ChatMessage chatMessage) {
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("type", "chat");
+        payload.put("messageId", chatMessage.messageId());
+        payload.put("sender", chatMessage.sender());
+        payload.put("content", chatMessage.content());
+        payload.put("serverTime", chatMessage.serverTime());
+        payload.put("messageType", chatMessage.messageType());
+        if (chatMessage.image() != null) {
+            payload.put("image", chatMessage.image());
+        }
+        return payload;
     }
 
     /**
@@ -326,6 +425,28 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
     }
 
     /**
+     * 从 JSON 消息中读取整数字段。
+     */
+    private int intValue(JsonNode body, String fieldName) {
+        JsonNode field = body.get(fieldName);
+        if (field == null || !field.canConvertToInt()) {
+            return 0;
+        }
+        return field.asInt();
+    }
+
+    /**
+     * 解码 base64 图片并返回真实字节数。
+     */
+    private long decodedImageSize(String base64Data) {
+        try {
+            return Base64.getDecoder().decode(base64Data).length;
+        } catch (IllegalArgumentException ex) {
+            return -1;
+        }
+    }
+
+    /**
      * 校验房间号格式。
      *
      * <p>只允许字母、数字、下划线和短横线，避免前端展示和日志排查时出现难处理字符。</p>
@@ -357,5 +478,14 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
             case NICKNAME_EXISTS -> "nickname already exists";
             case OK -> "joined";
         };
+    }
+
+    /**
+     * 客户端消息校验失败。
+     */
+    private static class InvalidClientMessageException extends IOException {
+        InvalidClientMessageException(String message) {
+            super(message);
+        }
     }
 }

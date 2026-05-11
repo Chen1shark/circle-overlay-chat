@@ -10,5 +10,9 @@ chat:
   max-users-per-room: 10
   history-limit: 200
   max-message-length: 500
+  # 单张图片压缩后允许发送的最大字节数：默认约 650KB。
+  max-image-bytes: 665600
+  # WebSocket 单条消息缓冲区：图片会以 dataUrl 放在 JSON 里，需大于 max-image-bytes 的 base64 体积。
+  websocket-message-buffer-bytes: 950000
   # WebSocket 空闲超时：客户端每 20 秒发送 ping，断线后默认最多约 90 秒清理僵尸连接。
   websocket-idle-timeout-ms: 90000

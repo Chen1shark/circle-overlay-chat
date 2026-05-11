@@ -86,6 +86,167 @@ class ChatWebSocketHandlerTest {
     }
 
     /**
+     * 合法图片消息要能广播，并且新用户加入时可以从内存历史中收到该图片。
+     */
+    @Test
+    void broadcastsImageMessageAndKeepsItInHistory() throws Exception {
+        ChatProperties properties = defaultProperties();
+        ConnectionLimiter limiter = new ConnectionLimiter(properties);
+        ChatWebSocketHandler handler = newHandler(properties, limiter);
+        WebSocketSession alice = session("s1");
+        WebSocketSession bob = session("s2");
+
+        handler.afterConnectionEstablished(alice);
+        handler.handleTextMessage(alice, new TextMessage("""
+            {"type":"join","roomId":"live001","nickname":"alice","accessKey":"test-key"}
+            """));
+        handler.handleTextMessage(alice, new TextMessage("""
+            {
+              "type":"chat",
+              "messageType":"image",
+              "content":"",
+              "image":{
+                "mimeType":"image/png",
+                "dataUrl":"data:image/png;base64,AQID",
+                "width":1,
+                "height":1,
+                "size":3
+              }
+            }
+            """));
+
+        JsonNode imageBroadcast = sentMessages(alice).stream()
+            .filter(body -> "chat".equals(body.path("type").asText()))
+            .filter(body -> "image".equals(body.path("messageType").asText()))
+            .findFirst()
+            .orElseThrow();
+
+        assertThat(imageBroadcast.path("sender").asText()).isEqualTo("alice");
+        assertThat(imageBroadcast.path("image").path("mimeType").asText()).isEqualTo("image/png");
+        assertThat(imageBroadcast.path("image").path("size").asLong()).isEqualTo(3);
+
+        handler.afterConnectionEstablished(bob);
+        handler.handleTextMessage(bob, new TextMessage("""
+            {"type":"join","roomId":"live001","nickname":"bob","accessKey":"test-key"}
+            """));
+
+        boolean historyContainsImage = false;
+        for (JsonNode body : sentMessages(bob)) {
+            if (!"history".equals(body.path("type").asText())) {
+                continue;
+            }
+            for (JsonNode message : body.path("messages")) {
+                if ("image".equals(message.path("messageType").asText())
+                    && "data:image/png;base64,AQID".equals(message.path("image").path("dataUrl").asText())) {
+                    historyContainsImage = true;
+                    break;
+                }
+            }
+        }
+
+        assertThat(historyContainsImage).isTrue();
+    }
+
+    /**
+     * 图片真实解码后的字节数超过限制时要拒绝。
+     */
+    @Test
+    void rejectsImageMessageWhenDecodedBytesExceedLimit() throws Exception {
+        ChatProperties properties = defaultProperties();
+        properties.setMaxImageBytes(2);
+        ConnectionLimiter limiter = new ConnectionLimiter(properties);
+        ChatWebSocketHandler handler = newHandler(properties, limiter);
+        WebSocketSession session = session("s1");
+
+        handler.afterConnectionEstablished(session);
+        handler.handleTextMessage(session, new TextMessage("""
+            {"type":"join","roomId":"live001","nickname":"alice","accessKey":"test-key"}
+            """));
+        handler.handleTextMessage(session, new TextMessage("""
+            {
+              "type":"chat",
+              "messageType":"image",
+              "content":"",
+              "image":{
+                "mimeType":"image/png",
+                "dataUrl":"data:image/png;base64,AQID",
+                "width":1,
+                "height":1,
+                "size":1
+              }
+            }
+            """));
+
+        boolean hasTooLargeError = sentMessages(session).stream()
+            .anyMatch(body -> "error".equals(body.path("type").asText())
+                && "image is too large".equals(body.path("message").asText()));
+
+        assertThat(hasTooLargeError).isTrue();
+    }
+
+    /**
+     * 不允许发送 GIF 或其他非白名单图片类型。
+     */
+    @Test
+    void rejectsUnsupportedImageMimeType() throws Exception {
+        ChatProperties properties = defaultProperties();
+        ConnectionLimiter limiter = new ConnectionLimiter(properties);
+        ChatWebSocketHandler handler = newHandler(properties, limiter);
+        WebSocketSession session = session("s1");
+
+        handler.afterConnectionEstablished(session);
+        handler.handleTextMessage(session, new TextMessage("""
+            {"type":"join","roomId":"live001","nickname":"alice","accessKey":"test-key"}
+            """));
+        handler.handleTextMessage(session, new TextMessage("""
+            {
+              "type":"chat",
+              "messageType":"image",
+              "content":"",
+              "image":{
+                "mimeType":"image/gif",
+                "dataUrl":"data:image/gif;base64,AQID",
+                "width":1,
+                "height":1,
+                "size":3
+              }
+            }
+            """));
+
+        boolean hasUnsupportedTypeError = sentMessages(session).stream()
+            .anyMatch(body -> "error".equals(body.path("type").asText())
+                && "unsupported image type".equals(body.path("message").asText()));
+
+        assertThat(hasUnsupportedTypeError).isTrue();
+    }
+
+    /**
+     * 旧客户端不传 messageType 时，服务端仍按文本消息处理。
+     */
+    @Test
+    void keepsLegacyTextMessageCompatible() throws Exception {
+        ChatProperties properties = defaultProperties();
+        ConnectionLimiter limiter = new ConnectionLimiter(properties);
+        ChatWebSocketHandler handler = newHandler(properties, limiter);
+        WebSocketSession session = session("s1");
+
+        handler.afterConnectionEstablished(session);
+        handler.handleTextMessage(session, new TextMessage("""
+            {"type":"join","roomId":"live001","nickname":"alice","accessKey":"test-key"}
+            """));
+        handler.handleTextMessage(session, new TextMessage("""
+            {"type":"chat","content":"hello"}
+            """));
+
+        boolean hasTextMessage = sentMessages(session).stream()
+            .anyMatch(body -> "chat".equals(body.path("type").asText())
+                && "text".equals(body.path("messageType").asText())
+                && "hello".equals(body.path("content").asText()));
+
+        assertThat(hasTextMessage).isTrue();
+    }
+
+    /**
      * 创建带真实依赖的 WebSocket handler，便于验证连接清理逻辑。
      */
     private ChatWebSocketHandler newHandler(ChatProperties properties, ConnectionLimiter limiter) {
@@ -109,6 +270,8 @@ class ChatWebSocketHandlerTest {
         properties.setMaxUsersPerRoom(10);
         properties.setHistoryLimit(200);
         properties.setMaxMessageLength(500);
+        properties.setMaxImageBytes(665_600);
+        properties.setWebsocketMessageBufferBytes(950_000);
         properties.setWebsocketIdleTimeoutMs(90_000);
         return properties;
     }
@@ -121,5 +284,23 @@ class ChatWebSocketHandlerTest {
         when(session.getId()).thenReturn(id);
         when(session.isOpen()).thenReturn(true);
         return session;
+    }
+
+    /**
+     * 读取 mock 会话已经发送过的所有 JSON 消息。
+     */
+    private java.util.List<JsonNode> sentMessages(WebSocketSession session) throws Exception {
+        ArgumentCaptor<TextMessage> captor = ArgumentCaptor.forClass(TextMessage.class);
+        verify(session, atLeastOnce()).sendMessage(captor.capture());
+        return captor.getAllValues().stream()
+            .map(TextMessage::getPayload)
+            .map(payload -> {
+                try {
+                    return objectMapper.readTree(payload);
+                } catch (IOException ex) {
+                    throw new IllegalStateException(ex);
+                }
+            })
+            .toList();
     }
 }

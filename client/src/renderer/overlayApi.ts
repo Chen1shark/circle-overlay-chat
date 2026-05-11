@@ -5,7 +5,12 @@ const browserFallback: OverlayApi = {
   close: async () => undefined,
   flashAttention: async () => false,
   setAlwaysOnTop: async (enabled: boolean) => enabled,
-  onAlwaysOnTopChanged: () => () => undefined
+  onAlwaysOnTopChanged: () => () => undefined,
+  captureScreenshot: async () => null,
+  readyScreenshot: async () => false,
+  showScreenshot: async () => false,
+  completeScreenshot: async () => null,
+  onScreenshotInit: () => () => undefined
 };
 
 export const overlayApi: OverlayApi = {

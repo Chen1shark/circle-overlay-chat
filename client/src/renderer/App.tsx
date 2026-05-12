@@ -1425,7 +1425,7 @@ function renderMessageContent(content: string, nickname: string): ReactNode {
   const mention = `@${nickname}`;
   const nodes: ReactNode[] = [];
   let cursor = 0;
-  let nextIndex = content.indexOf(mention);
+  let nextIndex = findMentionIndex(content, mention, cursor);
 
   while (nextIndex !== -1) {
     if (nextIndex > cursor) {
@@ -1437,7 +1437,7 @@ function renderMessageContent(content: string, nickname: string): ReactNode {
       </span>
     );
     cursor = nextIndex + mention.length;
-    nextIndex = content.indexOf(mention, cursor);
+    nextIndex = findMentionIndex(content, mention, cursor);
   }
 
   if (cursor < content.length) {
@@ -1445,6 +1445,33 @@ function renderMessageContent(content: string, nickname: string): ReactNode {
   }
 
   return nodes.length > 0 ? nodes : content;
+}
+
+function findMentionIndex(content: string, mention: string, start: number) {
+  let index = content.indexOf(mention, start);
+  while (index !== -1) {
+    if (hasMentionBoundary(content, index + mention.length)) {
+      return index;
+    }
+    index = content.indexOf(mention, index + 1);
+  }
+  return -1;
+}
+
+function hasMentionBoundary(content: string, end: number) {
+  if (end >= content.length) {
+    return true;
+  }
+  const codePoint = content.codePointAt(end);
+  if (codePoint === undefined) {
+    return true;
+  }
+  const nextChar = String.fromCodePoint(codePoint);
+  return /\s/u.test(nextChar) || isMentionPunctuation(nextChar);
+}
+
+function isMentionPunctuation(value: string) {
+  return value !== '_' && /\p{P}/u.test(value);
 }
 
 function formatTime(value: number) {

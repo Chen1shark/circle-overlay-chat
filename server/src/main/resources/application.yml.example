@@ -16,3 +16,25 @@ chat:
   websocket-message-buffer-bytes: 950000
   # WebSocket 空闲超时：客户端每 20 秒发送 ping，断线后默认最多约 90 秒清理僵尸连接。
   websocket-idle-timeout-ms: 90000
+
+  ai:
+    # 是否启用房间 AI 虚拟成员；未配置模型密钥前保持 false。
+    enabled: false
+    # AI 在成员列表和聊天消息中的显示名称；真实名称请只写入本地 application.yml。
+    name: ""
+    # AI 角色提示词；真实提示词请只写入本地 application.yml。
+    prompt: ""
+    # OpenAI 兼容接口地址，可填写 https://example.com/v1 或完整 /chat/completions 地址。
+    base-url: ""
+    # OpenAI 兼容接口密钥；不要提交真实密钥。
+    api-key: ""
+    # 模型名称。
+    model: ""
+    # 回复随机性，0.7 适合聊天角色。
+    temperature: 0.7
+    # 单次回复最大输出 token 数。
+    max-output-tokens: 800
+    # AI 请求超时时间，单位毫秒。
+    timeout-ms: 30000
+    # 兼容支持 thinking 字段的模型：true 时请求体加入 thinking.type=disabled。
+    thinking-disabled: true

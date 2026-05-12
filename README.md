@@ -23,6 +23,8 @@ CiRCLE/
 - 图片发送前会在客户端压缩，默认最长边 `1920px`、目标约 `500KB`、最大约 `650KB`
 - 输入 `@` 时弹出在线成员列表，选中后插入 `@昵称`
 - 消息中 `@我的昵称` 会高亮显示
+- 可选 AI 虚拟成员：配置后会显示在成员列表第一位，输入 `@` 时也会优先出现在候选列表
+- AI 通过 `@AI` 或 `@配置的AI名字` 触发回复，只读取房间内最近文本历史，不读取图片
 - 成员加入或离开时显示居中的系统提示
 - 右键消息复制文本，触屏设备可长按复制
 - 收到他人消息时，如果窗口最小化或不可见，会触发任务栏提醒
@@ -99,6 +101,18 @@ chat:
   max-image-bytes: 665600
   websocket-message-buffer-bytes: 950000
   websocket-idle-timeout-ms: 90000
+
+  ai:
+    enabled: false
+    name: ""
+    prompt: ""
+    base-url: ""
+    api-key: ""
+    model: ""
+    temperature: 0.7
+    max-output-tokens: 800
+    timeout-ms: 30000
+    thinking-disabled: true
 ```
 
 配置项说明：
@@ -113,10 +127,22 @@ chat:
 - `chat.max-image-bytes`：单张图片压缩后允许发送的最大字节数
 - `chat.websocket-message-buffer-bytes`：WebSocket 单条消息缓冲区大小，图片会以 dataUrl 放在 JSON 中，需要大于图片 base64 体积
 - `chat.websocket-idle-timeout-ms`：WebSocket 空闲超时时间，用于清理异常断开的连接
+- `chat.ai.enabled`：是否启用 AI 虚拟成员
+- `chat.ai.name`：AI 在成员列表和聊天消息里的显示名称
+- `chat.ai.prompt`：AI 的角色提示词，只写在本地 `application.yml`
+- `chat.ai.base-url`：OpenAI 兼容接口地址，可写根地址或完整 `/chat/completions` 地址
+- `chat.ai.api-key`：OpenAI 兼容接口密钥，只写在本地 `application.yml`
+- `chat.ai.model`：模型名称
+- `chat.ai.temperature`：回复随机性，默认 `0.7`
+- `chat.ai.max-output-tokens`：单次 AI 回复最大输出 token 数，默认 `800`
+- `chat.ai.timeout-ms`：AI 请求超时时间，默认 `30000`
+- `chat.ai.thinking-disabled`：为 `true` 时请求体加入 `thinking.type=disabled`
 
 客户端每 `20` 秒发送一次 `ping` 心跳。连接异常断开后，如果服务端在空闲超时时间内收不到任何消息，会自动关闭并清理该连接。
 
 图片只做临时聊天传递：压缩发生在客户端，服务端只校验和转发，不保存到磁盘。图片和文字消息共用内存历史，服务端重启后都会丢失。
+
+AI 配置必须写在 `chat.ai` 下面，不要写成和 `chat` 同级的 `ai`。修改 AI 配置后需要重启服务端。AI 启用后会作为虚拟成员显示在在线成员列表第一位，并且输入 `@` 时默认排在候选列表第一位；用户发送包含 `@AI` 或 `@AI名称` 的文本消息后，服务端会异步生成 AI 回复并广播到房间。
 
 ## 本地运行
 
@@ -250,6 +276,8 @@ client/release/CiRCLE/
 - `server/src/main/resources/application.yml`
 - 真实服务器 IP
 - 真实房间口令
+- 真实 AI API Key
+- 真实 AI 提示词
 - `node_modules`
 - `target`
 - `dist`
@@ -287,6 +315,17 @@ server/src/main/resources/application.yml
 ```
 
 其中 `server.port` 决定服务端端口，`chat.access-key` 决定进入房间时需要输入的口令。
+
+### 为什么进房间后没看到 AI？
+
+先检查 `server/src/main/resources/application.yml`：
+
+- `ai` 必须缩进在 `chat` 下面，也就是 `chat.ai`
+- `chat.ai.enabled` 必须是 `true`
+- `chat.ai.name` 不能为空
+- 修改配置后必须重启后端
+
+AI 不会单独弹出窗口。它会显示在在线成员列表里，并且输入 `@` 时排在候选列表第一位。发送 `@AI` 或 `@配置的AI名字` 后才会触发回复。
 
 ### 手机能不能像桌面端一样透明置顶？
 

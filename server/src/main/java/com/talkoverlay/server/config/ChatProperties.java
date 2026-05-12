@@ -38,6 +38,9 @@ public class ChatProperties {
     /** WebSocket 连接无消息读入时的最大空闲时间，单位毫秒。 */
     private long websocketIdleTimeoutMs = 90_000;
 
+    /** AI 虚拟成员配置，默认关闭。 */
+    private Ai ai = new Ai();
+
     public String getAccessKey() {
         return accessKey;
     }
@@ -108,5 +111,131 @@ public class ChatProperties {
 
     public void setWebsocketIdleTimeoutMs(long websocketIdleTimeoutMs) {
         this.websocketIdleTimeoutMs = websocketIdleTimeoutMs;
+    }
+
+    public Ai getAi() {
+        return ai;
+    }
+
+    public void setAi(Ai ai) {
+        this.ai = ai == null ? new Ai() : ai;
+    }
+
+    /**
+     * 聊天房间 AI 虚拟成员配置。
+     *
+     * <p>真实密钥、模型地址和角色提示词只应写在本地 {@code application.yml} 中，
+     * 不应提交到 Git 仓库。</p>
+     */
+    public static class Ai {
+        /** 是否启用 AI 虚拟成员。 */
+        private boolean enabled = false;
+
+        /** AI 在房间成员列表和消息中的显示名称。 */
+        private String name = "";
+
+        /** 发送给模型的 system prompt，用于定义角色和回复风格。 */
+        private String prompt = "";
+
+        /** OpenAI 兼容接口地址，可填写根地址或完整 chat/completions 地址。 */
+        private String baseUrl = "";
+
+        /** OpenAI 兼容接口密钥。 */
+        private String apiKey = "";
+
+        /** 模型名称。 */
+        private String model = "";
+
+        /** 回复随机性，值越高越发散。 */
+        private double temperature = 0.7;
+
+        /** 单次回复的最大输出 token 数。 */
+        private int maxOutputTokens = 800;
+
+        /** AI 请求超时时间，单位毫秒。 */
+        private long timeoutMs = 30_000;
+
+        /** 是否在请求体中关闭模型思考模式。 */
+        private boolean thinkingDisabled = true;
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        public String getName() {
+            return name;
+        }
+
+        public void setName(String name) {
+            this.name = name == null ? "" : name;
+        }
+
+        public String getPrompt() {
+            return prompt;
+        }
+
+        public void setPrompt(String prompt) {
+            this.prompt = prompt == null ? "" : prompt;
+        }
+
+        public String getBaseUrl() {
+            return baseUrl;
+        }
+
+        public void setBaseUrl(String baseUrl) {
+            this.baseUrl = baseUrl == null ? "" : baseUrl;
+        }
+
+        public String getApiKey() {
+            return apiKey;
+        }
+
+        public void setApiKey(String apiKey) {
+            this.apiKey = apiKey == null ? "" : apiKey;
+        }
+
+        public String getModel() {
+            return model;
+        }
+
+        public void setModel(String model) {
+            this.model = model == null ? "" : model;
+        }
+
+        public double getTemperature() {
+            return temperature;
+        }
+
+        public void setTemperature(double temperature) {
+            this.temperature = temperature;
+        }
+
+        public int getMaxOutputTokens() {
+            return maxOutputTokens;
+        }
+
+        public void setMaxOutputTokens(int maxOutputTokens) {
+            this.maxOutputTokens = maxOutputTokens;
+        }
+
+        public long getTimeoutMs() {
+            return timeoutMs;
+        }
+
+        public void setTimeoutMs(long timeoutMs) {
+            this.timeoutMs = timeoutMs;
+        }
+
+        public boolean isThinkingDisabled() {
+            return thinkingDisabled;
+        }
+
+        public void setThinkingDisabled(boolean thinkingDisabled) {
+            this.thinkingDisabled = thinkingDisabled;
+        }
     }
 }

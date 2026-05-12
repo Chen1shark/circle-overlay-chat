@@ -2,6 +2,7 @@ package com.talkoverlay.server.websocket;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.talkoverlay.server.ai.AiResponder;
 import com.talkoverlay.server.config.ChatProperties;
 import com.talkoverlay.server.model.ChatMessage;
 import com.talkoverlay.server.model.ChatMessage.ImagePayload;
@@ -11,12 +12,14 @@ import com.talkoverlay.server.room.RoomRegistry;
 import com.talkoverlay.server.room.RoomRegistry.JoinStatus;
 import com.talkoverlay.server.room.RoomRegistry.RoomSnapshot;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import org.springframework.stereotype.Component;
 import org.springframework.web.socket.CloseStatus;
@@ -49,20 +52,24 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
     private final RoomRegistry roomRegistry;
     private final MessageHistoryStore historyStore;
     private final ConnectionLimiter connectionLimiter;
+    private final AiResponder aiResponder;
     private final Set<String> acceptedSessions = ConcurrentHashMap.newKeySet();
+    private final Set<String> aiActiveRooms = ConcurrentHashMap.newKeySet();
 
     public ChatWebSocketHandler(
         ObjectMapper objectMapper,
         ChatProperties properties,
         RoomRegistry roomRegistry,
         MessageHistoryStore historyStore,
-        ConnectionLimiter connectionLimiter
+        ConnectionLimiter connectionLimiter,
+        AiResponder aiResponder
     ) {
         this.objectMapper = objectMapper;
         this.properties = properties;
         this.roomRegistry = roomRegistry;
         this.historyStore = historyStore;
         this.connectionLimiter = connectionLimiter;
+        this.aiResponder = aiResponder;
     }
 
     /**
@@ -175,6 +182,10 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
             sendError(session, "invalid nickname");
             return;
         }
+        if (aiResponder.isVirtualMember(nickname)) {
+            sendError(session, "nickname already exists");
+            return;
+        }
 
         RoomRegistry.JoinResult result = roomRegistry.join(session.getId(), session, roomId, nickname);
         if (result.status() != JoinStatus.OK) {
@@ -185,7 +196,7 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
         send(session, Map.of(
             "type", "joined",
             "roomId", roomId,
-            "online", result.snapshot().online()
+            "online", presenceOnline(result.snapshot())
         ));
         send(session, Map.of(
             "type", "history",
@@ -246,6 +257,7 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
             null
         );
         broadcastChatMessage(participant.roomId(), chatMessage);
+        requestAiReplyIfNeeded(participant.roomId(), chatMessage);
     }
 
     /**
@@ -300,8 +312,46 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
      * 写入历史并广播聊天消息。
      */
     private void broadcastChatMessage(String roomId, ChatMessage chatMessage) {
+        List<WebSocketSession> sessions = roomRegistry.roomSessions(roomId);
+        if (sessions.isEmpty()) {
+            return;
+        }
         historyStore.add(roomId, chatMessage);
-        broadcast(roomRegistry.roomSessions(roomId), chatPayload(chatMessage));
+        broadcast(sessions, chatPayload(chatMessage));
+    }
+
+    /**
+     * 如果用户消息 @ 到 AI，则异步生成一条 AI 回复。
+     */
+    private void requestAiReplyIfNeeded(String roomId, ChatMessage chatMessage) {
+        if (!aiResponder.shouldReply(chatMessage)) {
+            return;
+        }
+        if (!aiActiveRooms.add(roomId)) {
+            broadcastSystemMessage(roomId, aiDisplayName() + " 正在回复，请稍后再试");
+            return;
+        }
+
+        List<ChatMessage> history = historyStore.get(roomId);
+        aiResponder.reply(history).whenComplete((reply, error) -> {
+            try {
+                if (error != null) {
+                    broadcastSystemMessage(roomId, "AI 回复失败：" + rootErrorMessage(error));
+                    return;
+                }
+                ChatMessage aiMessage = new ChatMessage(
+                    UUID.randomUUID().toString(),
+                    aiDisplayName(),
+                    reply,
+                    System.currentTimeMillis(),
+                    MESSAGE_TYPE_TEXT,
+                    null
+                );
+                broadcastChatMessage(roomId, aiMessage);
+            } finally {
+                aiActiveRooms.remove(roomId);
+            }
+        });
     }
 
     /**
@@ -329,12 +379,13 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
      * 向房间内所有成员广播在线成员列表。
      */
     private void broadcastPresence(RoomSnapshot snapshot) {
+        List<String> members = presenceMembers(snapshot);
         broadcast(snapshot.sessions(), Map.of(
             "type", "presence",
             "roomId", snapshot.roomId(),
-            "online", snapshot.online(),
+            "online", members.size(),
             "maxUsers", snapshot.maxUsers(),
-            "members", snapshot.members()
+            "members", members
         ));
     }
 
@@ -345,14 +396,62 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
      * 这类消息只实时广播，不写入历史，避免新用户进入时看到大量旧的加入/离开提示。</p>
      */
     private void broadcastSystemMessage(RoomSnapshot snapshot, String content) {
-        broadcast(snapshot.sessions(), chatPayload(new ChatMessage(
+        broadcast(snapshot.sessions(), chatPayload(systemMessage(content)));
+    }
+
+    /**
+     * 向指定房间广播系统提示消息。
+     */
+    private void broadcastSystemMessage(String roomId, String content) {
+        broadcast(roomRegistry.roomSessions(roomId), chatPayload(systemMessage(content)));
+    }
+
+    private ChatMessage systemMessage(String content) {
+        return new ChatMessage(
             UUID.randomUUID().toString(),
             SYSTEM_SENDER,
             content,
             System.currentTimeMillis(),
             MESSAGE_TYPE_TEXT,
             null
-        )));
+        );
+    }
+
+    private List<String> presenceMembers(RoomSnapshot snapshot) {
+        String displayName = aiResponder.displayName();
+        if (!aiResponder.hasVirtualMember() || displayName == null || displayName.isBlank()) {
+            return new ArrayList<>(snapshot.members());
+        }
+
+        List<String> members = new ArrayList<>();
+        members.add(displayName);
+        for (String member : snapshot.members()) {
+            if (!displayName.equals(member)) {
+                members.add(member);
+            }
+        }
+        return members;
+    }
+
+    private int presenceOnline(RoomSnapshot snapshot) {
+        return presenceMembers(snapshot).size();
+    }
+
+    private String aiDisplayName() {
+        String displayName = aiResponder.displayName();
+        return displayName == null || displayName.isBlank() ? "AI" : displayName;
+    }
+
+    private String rootErrorMessage(Throwable error) {
+        Throwable current = error;
+        while (current instanceof CompletionException && current.getCause() != null) {
+            current = current.getCause();
+        }
+        String message = current.getMessage();
+        if (message == null || message.isBlank()) {
+            return "未知错误";
+        }
+        return message;
     }
 
     /**
